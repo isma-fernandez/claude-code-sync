@@ -78,22 +78,49 @@ fn ends_segment(next: Option<char>) -> bool {
     }
 }
 
-/// Replace every occurrence of `needle` that ends a path segment with `token`.
-fn replace_bounded(content: &str, needle: &str, token: &str, also_allow_dash: bool) -> String {
+/// True when `prev` cannot be the tail of a longer path, so an occurrence of the home may
+/// begin here.
+///
+/// This matters most for short homes. With `/root`, the path `/var/lib/docker/root` and the
+/// CLI flag `--root` both contain the needle; without a leading boundary they would be
+/// tokenized and expand on the other machine to `/var/lib/docker/<other-home>` and
+/// `-<other-encoded-home>`. A preceding `/` is rejected for the plain form (`…docker//root`
+/// is never the home) but accepted for the encoded form, which legitimately follows one in
+/// `projects/-Users-alice-work`. A preceding `~` is rejected in both: `~/root` is a path
+/// *relative* to whatever home the reader has, so it is already portable as written.
+fn starts_segment(prev: Option<char>, allow_slash: bool) -> bool {
+    match prev {
+        None => true,
+        Some('/') => allow_slash,
+        Some('~') => false,
+        Some(c) => !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'),
+    }
+}
+
+/// Replace every whole-segment occurrence of `needle` with `token`.
+fn replace_bounded(content: &str, needle: &str, token: &str, encoded_form: bool) -> String {
     let mut out = String::with_capacity(content.len());
-    let mut rest = content;
-    while let Some(idx) = rest.find(needle) {
-        let after = &rest[idx + needle.len()..];
-        let next = after.chars().next();
-        out.push_str(&rest[..idx]);
-        if ends_segment(next) || (also_allow_dash && next == Some('-')) {
+    // Indices into the ORIGINAL string, so `prev` is the true preceding character even when
+    // one occurrence directly follows another. Re-slicing on each iteration would make a
+    // second `/root` in `/root/root/work` look like the start of the string and tokenize it,
+    // expanding on the other machine to `<home><home>/work`.
+    let mut pos = 0;
+    while let Some(rel) = content[pos..].find(needle) {
+        let start = pos + rel;
+        let end = start + needle.len();
+        let prev = content[..start].chars().next_back();
+        let next = content[end..].chars().next();
+        out.push_str(&content[pos..start]);
+        // In the encoded form `-` is the separator, so it also terminates an occurrence.
+        let ends = ends_segment(next) || (encoded_form && next == Some('-'));
+        if ends && starts_segment(prev, encoded_form) {
             out.push_str(token);
         } else {
             out.push_str(needle);
         }
-        rest = after;
+        pos = end;
     }
-    out.push_str(rest);
+    out.push_str(&content[pos..]);
     out
 }
 
@@ -107,7 +134,6 @@ pub fn to_portable(content: &str) -> String {
     };
     let out = replace_bounded(content, &home, HOME_TOKEN, false);
 
-    // In the encoded form `-` is the separator, so it also terminates an occurrence.
     match encoded_local_home() {
         Some(encoded) => replace_bounded(&out, &encoded, HOME_ENC_TOKEN, true),
         None => out,
@@ -336,6 +362,53 @@ mod tests {
             from_portable(&portable),
             "see /root/.claude/projects/-root-work/s.jsonl"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn short_home_needs_a_leading_boundary() {
+        // The server case: with home `/root`, unrelated content contains the needle.
+        let _g = with_home("/root");
+        assert_eq!(to_portable("/var/lib/docker/root"), "/var/lib/docker/root");
+        assert_eq!(
+            to_portable("cargo run --root file"),
+            "cargo run --root file"
+        );
+        assert_eq!(to_portable("the web-root dir"), "the web-root dir");
+        // While genuine occurrences still tokenize.
+        assert_eq!(
+            to_portable(r#"{"cwd":"/root/portalhero"}"#),
+            format!(r#"{{"cwd":"{HOME_TOKEN}/portalhero"}}"#)
+        );
+        assert_eq!(
+            to_portable("projects/-root-portalhero/s.jsonl"),
+            format!("projects/{HOME_ENC_TOKEN}-portalhero/s.jsonl")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn adjacent_occurrences_keep_their_true_predecessor() {
+        let _g = with_home("/root");
+        // /root/root/work is the home plus a subdirectory named root: only the first
+        // occurrence is the home.
+        assert_eq!(
+            to_portable("/root/root/work"),
+            format!("{HOME_TOKEN}/root/work")
+        );
+        // Neither occurrence here is the home.
+        assert_eq!(
+            to_portable("/var/lib/docker/root/root"),
+            "/var/lib/docker/root/root"
+        );
+        assert_eq!(to_portable("x-root-root"), "x-root-root");
+    }
+
+    #[test]
+    #[serial]
+    fn tilde_prefixed_paths_are_already_portable() {
+        let _g = with_home("/root");
+        assert_eq!(to_portable("see ~/root/notes.md"), "see ~/root/notes.md");
     }
 
     #[test]

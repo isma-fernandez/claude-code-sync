@@ -108,7 +108,14 @@ fn replace_bounded(content: &str, needle: &str, token: &str, encoded_form: bool)
     while let Some(rel) = content[pos..].find(needle) {
         let start = pos + rel;
         let end = start + needle.len();
-        let prev = content[..start].chars().next_back();
+        let mut before = content[..start].chars().rev();
+        let mut prev = before.next();
+        // Inside JSON-serialized strings a newline is the two-character escape `\n`, so a
+        // path at the start of an embedded line is preceded by the letter `n`. Treat the
+        // escapes `\n`, `\t` and `\r` as the whitespace they represent.
+        if matches!(prev, Some('n' | 't' | 'r')) && before.next() == Some('\\') {
+            prev = Some('\n');
+        }
         let next = content[end..].chars().next();
         out.push_str(&content[pos..start]);
         // In the encoded form `-` is the separator, so it also terminates an occurrence.
@@ -402,6 +409,21 @@ mod tests {
             "/var/lib/docker/root/root"
         );
         assert_eq!(to_portable("x-root-root"), "x-root-root");
+    }
+
+    #[test]
+    #[serial]
+    fn json_escaped_newlines_count_as_boundaries() {
+        let _g = with_home("/Users/alice");
+        // Inside a JSON string a newline is the escape `\n`; the path after it must still
+        // tokenize even though the raw predecessor is the letter `n`.
+        assert_eq!(
+            to_portable(r#"{"text":"---\n/Users/alice/work/f.vue"}"#),
+            format!(r#"{{"text":"---\n{HOME_TOKEN}/work/f.vue"}}"#)
+        );
+        // A word genuinely ending in `n` is still no boundary.
+        let _g2 = with_home("/root");
+        assert_eq!(to_portable("chaperon/root"), "chaperon/root");
     }
 
     #[test]

@@ -38,13 +38,6 @@ pub fn pull_history(
     let state = SyncState::load()?;
     let repo = scm::open(&state.sync_repo_path)?;
     let mut filter = FilterConfig::load()?;
-
-    // The repository decides the layout, not this machine's config: a machine that has not
-    // enabled portable_home must still read a portable repository correctly, or the two
-    // would rewrite each other's copies on every sync.
-    if crate::portable::repo_is_portable(&state.sync_repo_path) {
-        filter.portable_home = true;
-    }
     let claude_dir = claude_projects_dir()?;
 
     // Get the current branch name for operation record
@@ -64,6 +57,15 @@ pub fn pull_history(
                 log::info!("Continuing with local sync repository state...");
             }
         }
+    }
+
+    // The repository decides the layout, not this machine's config: a machine that has not
+    // enabled portable_home must still read a portable repository correctly, or the two
+    // would rewrite each other's copies on every sync. Checked AFTER the fetch above — on a
+    // first pull the marker only exists remotely, and deciding before fetching would leave
+    // the placeholder directory names undecoded.
+    if crate::portable::repo_is_portable(&state.sync_repo_path) {
+        filter.portable_home = true;
     }
 
     // Discover local sessions

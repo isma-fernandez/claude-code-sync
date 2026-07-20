@@ -21,6 +21,13 @@ use std::path::PathBuf;
 /// Placeholder for the home directory inside session and artifact content.
 pub const HOME_TOKEN: &str = "{{CLAUDE_SYNC_HOME}}";
 
+/// Placeholder for the home in its *encoded* form, as Claude Code names project directories.
+///
+/// Transcripts quote those names whenever they reference `~/.claude/projects/...`, and on
+/// another machine the quoted directory genuinely has a different name, so leaving it alone
+/// would point at a path that does not exist there.
+pub const HOME_ENC_TOKEN: &str = "{{CLAUDE_SYNC_HOME_ENC}}";
+
 /// Placeholder for the home directory in encoded project directory names.
 ///
 /// Encoded paths always start with `-` (the leading `/` of an absolute path), so a name
@@ -71,40 +78,57 @@ fn ends_segment(next: Option<char>) -> bool {
     }
 }
 
-/// Replace the local home prefix with [`HOME_TOKEN`]. No-op when the home is unknown.
-pub fn to_portable(content: &str) -> String {
-    let Some(home) = local_home_str() else {
-        return content.to_string();
-    };
-
+/// Replace every occurrence of `needle` that ends a path segment with `token`.
+fn replace_bounded(content: &str, needle: &str, token: &str, also_allow_dash: bool) -> String {
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
-    while let Some(idx) = rest.find(&home) {
-        let after = &rest[idx + home.len()..];
+    while let Some(idx) = rest.find(needle) {
+        let after = &rest[idx + needle.len()..];
+        let next = after.chars().next();
         out.push_str(&rest[..idx]);
-        if ends_segment(after.chars().next()) {
-            out.push_str(HOME_TOKEN);
-            rest = after;
+        if ends_segment(next) || (also_allow_dash && next == Some('-')) {
+            out.push_str(token);
         } else {
-            out.push_str(&home);
-            rest = after;
+            out.push_str(needle);
         }
+        rest = after;
     }
     out.push_str(rest);
     out
 }
 
-/// Expand [`HOME_TOKEN`] back to the local home. No-op when the home is unknown.
+/// Replace the local home with a placeholder, in both the forms it appears in content:
+/// the plain path (`/Users/alice/work`) and Claude's encoded directory name
+/// (`-Users-alice-work`, which transcripts quote whenever they reference
+/// `~/.claude/projects/`). No-op when the home is unknown.
+pub fn to_portable(content: &str) -> String {
+    let Some(home) = local_home_str() else {
+        return content.to_string();
+    };
+    let out = replace_bounded(content, &home, HOME_TOKEN, false);
+
+    // In the encoded form `-` is the separator, so it also terminates an occurrence.
+    match encoded_local_home() {
+        Some(encoded) => replace_bounded(&out, &encoded, HOME_ENC_TOKEN, true),
+        None => out,
+    }
+}
+
+/// Expand both placeholders back to the local home. No-op when the home is unknown.
 pub fn from_portable(content: &str) -> String {
-    match local_home_str() {
-        Some(home) => content.replace(HOME_TOKEN, &home),
-        None => content.to_string(),
+    let Some(home) = local_home_str() else {
+        return content.to_string();
+    };
+    let out = content.replace(HOME_TOKEN, &home);
+    match encoded_local_home() {
+        Some(encoded) => out.replace(HOME_ENC_TOKEN, &encoded),
+        None => out,
     }
 }
 
 /// True when the content carries a placeholder that needs expanding.
 pub fn has_token(content: &str) -> bool {
-    content.contains(HOME_TOKEN)
+    content.contains(HOME_TOKEN) || content.contains(HOME_ENC_TOKEN)
 }
 
 /// Marker at the root of a sync repository whose contents are stored in portable form.
@@ -294,6 +318,31 @@ mod tests {
             portable,
             format!(r#"{{"a":"{HOME_TOKEN}/work","b":"/Users/alice-backup/notes.md"}}"#)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn tokenizes_the_encoded_project_directory_name_too() {
+        let portable = {
+            let _g = with_home("/Users/alice");
+            to_portable("see /Users/alice/.claude/projects/-Users-alice-work/s.jsonl")
+        };
+        assert!(!portable.contains("/Users/alice"));
+        assert!(!portable.contains("-Users-alice"));
+
+        // On the receiving machine both forms name the directory that actually exists there.
+        let _g = with_home("/root");
+        assert_eq!(
+            from_portable(&portable),
+            "see /root/.claude/projects/-root-work/s.jsonl"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn does_not_tokenize_a_longer_encoded_sibling() {
+        let _g = with_home("/Users/alice");
+        assert_eq!(to_portable("-Users-alicexyz-work"), "-Users-alicexyz-work");
     }
 
     #[test]

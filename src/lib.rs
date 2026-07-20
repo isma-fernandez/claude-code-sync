@@ -115,6 +115,10 @@ pub mod onboarding;
 /// file snapshots, etc.) with metadata like timestamps, UUIDs, and session IDs.
 pub mod parser;
 
+/// Home-directory portability, so a project syncs across machines whose home directories
+/// differ (`/Users/alice` vs `/root`) without replicating one machine's paths on the other.
+pub mod portable;
+
 /// Conflict report generation and formatting.
 ///
 /// Generates detailed reports of sync conflicts in multiple formats (JSON, Markdown, console).

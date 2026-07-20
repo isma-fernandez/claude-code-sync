@@ -495,7 +495,12 @@ pub fn pull_history(
                 .strip_prefix(&remote_projects_dir)
                 .ok()
                 .unwrap_or_else(|| Path::new(&remote_session.file_path));
-            (claude_dir.join(relative_path), relative_path.to_path_buf())
+            let relative_path = if filter.portable_home {
+                crate::portable::decode_relative_path(relative_path)
+            } else {
+                relative_path.to_path_buf()
+            };
+            (claude_dir.join(&relative_path), relative_path)
         };
 
         // Determine operation type based on local state

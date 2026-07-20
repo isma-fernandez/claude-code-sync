@@ -69,12 +69,14 @@ fn compute_relative_path(
         let project_name = session.project_name()?;
         Some(PathBuf::from(project_name).join(filename))
     } else {
-        Some(
-            Path::new(&session.file_path)
-                .strip_prefix(claude_dir)
-                .unwrap_or(Path::new(&session.file_path))
-                .to_path_buf(),
-        )
+        let relative = Path::new(&session.file_path)
+            .strip_prefix(claude_dir)
+            .unwrap_or(Path::new(&session.file_path));
+        if filter.portable_home {
+            Some(crate::portable::encode_relative_path(relative))
+        } else {
+            Some(relative.to_path_buf())
+        }
     }
 }
 
@@ -234,7 +236,11 @@ pub fn push_history(
         let dest_path = projects_dir.join(&entry.relative_path);
 
         // Write the session file
-        session.write_to_file(&dest_path)?;
+        if filter.portable_home {
+            session.write_to_file_portable(&dest_path)?;
+        } else {
+            session.write_to_file(&dest_path)?;
+        }
 
         // Track this session in pushed conversations
         let relative_path_str = entry.relative_path.to_string_lossy().to_string();

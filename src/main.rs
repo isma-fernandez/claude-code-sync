@@ -175,6 +175,11 @@ enum Commands {
         #[arg(long)]
         use_project_name_only: Option<bool>,
 
+        /// Store the home directory as a placeholder so machines with different homes
+        /// (/Users/alice vs /root) share the same projects without replicating paths
+        #[arg(long)]
+        portable_home: Option<bool>,
+
         /// Enable artifact categories (comma-separated names or "all"),
         /// e.g. "settings,skills,prompt-history"
         #[arg(long)]
@@ -551,6 +556,7 @@ fn main() -> Result<()> {
             scm_backend,
             sync_subdirectory,
             use_project_name_only,
+            portable_home,
             enable_artifacts,
             disable_artifacts,
             show,
@@ -568,6 +574,7 @@ fn main() -> Result<()> {
                 || scm_backend.is_some()
                 || sync_subdirectory.is_some()
                 || use_project_name_only.is_some()
+                || portable_home.is_some()
                 || enable_artifacts.is_some()
                 || disable_artifacts.is_some()
                 || show
@@ -597,6 +604,7 @@ fn main() -> Result<()> {
                     scm_backend,
                     sync_subdirectory,
                     use_project_name_only,
+                    portable_home,
                     enable_artifacts,
                     disable_artifacts,
                 )?;

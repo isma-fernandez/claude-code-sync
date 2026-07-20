@@ -55,6 +55,15 @@ pub struct FilterConfig {
     #[serde(default)]
     pub use_project_name_only: bool,
 
+    /// Store the home directory as a placeholder instead of an absolute path.
+    /// Project directory names and session content are rewritten on push and expanded back to
+    /// the local home on pull, so a project syncs between machines whose homes differ
+    /// (`/Users/alice` vs `/root`) without replicating one machine's layout on the other.
+    /// Unlike `use_project_name_only`, everything below the home is preserved, so projects
+    /// sharing a directory name — worktrees, monorepo subdirectories — stay distinct.
+    #[serde(default)]
+    pub portable_home: bool,
+
     /// Per-category switches for syncing Claude Code artifacts beyond
     /// conversation history (settings, skills, agents, ...). All default to
     /// false so configs from older versions keep their exact behavior.
@@ -91,6 +100,7 @@ impl Default for FilterConfig {
             scm_backend: default_scm_backend(),
             sync_subdirectory: default_sync_subdirectory(),
             use_project_name_only: false,
+            portable_home: false,
             sync_artifacts: Default::default(),
         }
     }
@@ -309,6 +319,7 @@ pub fn update_config(
     scm_backend: Option<String>,
     sync_subdirectory: Option<String>,
     use_project_name_only: Option<bool>,
+    portable_home: Option<bool>,
     enable_artifacts: Option<String>,
     disable_artifacts: Option<String>,
 ) -> Result<()> {
@@ -408,6 +419,22 @@ pub fn update_config(
                     "enabled (multi-device mode)"
                 } else {
                     "disabled (full path mode)"
+                }
+            )
+            .green()
+        );
+    }
+
+    if let Some(portable) = portable_home {
+        config.portable_home = portable;
+        println!(
+            "{}",
+            format!(
+                "Portable home: {}",
+                if portable {
+                    "enabled (home stored as a placeholder)"
+                } else {
+                    "disabled (absolute home paths)"
                 }
             )
             .green()
@@ -536,6 +563,22 @@ pub fn show_config() -> Result<()> {
             "Yes (multi-device mode)".green()
         } else {
             "No (full path mode)".yellow()
+        }
+    );
+    println!(
+        "  {}: {}",
+        "Portable home".cyan(),
+        if config.portable_home {
+            format!(
+                "Yes (stored as {}, local home {})",
+                crate::portable::HOME_TOKEN,
+                crate::portable::local_home()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
+            .green()
+        } else {
+            "No (absolute home paths)".yellow()
         }
     );
 

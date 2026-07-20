@@ -131,6 +131,16 @@ impl ConversationSession {
                 continue;
             }
 
+            // Sessions read out of the sync repository carry a home placeholder instead of an
+            // absolute home path. Expanding it here means every consumer — hashing, conflict
+            // detection, pulling — works in local terms. Files that have no placeholder, which
+            // is every local session, come through untouched.
+            let line = if crate::portable::has_token(&line) {
+                crate::portable::from_portable(&line)
+            } else {
+                line
+            };
+
             let entry: ConversationEntry = serde_json::from_str(&line).with_context(|| {
                 format!(
                     "Failed to parse JSON at line {} in {}",
@@ -177,8 +187,16 @@ impl ConversationSession {
 
     /// Write the conversation session to a JSONL file
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
+        self.write_inner(path.as_ref(), false)
+    }
 
+    /// Write the session with the local home replaced by a placeholder, for storage in the
+    /// sync repository. See [`crate::portable`].
+    pub fn write_to_file_portable<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.write_inner(path.as_ref(), true)
+    }
+
+    fn write_inner(&self, path: &Path, portable: bool) -> Result<()> {
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -191,6 +209,11 @@ impl ConversationSession {
         for entry in &self.entries {
             let json =
                 serde_json::to_string(entry).context("Failed to serialize conversation entry")?;
+            let json = if portable {
+                crate::portable::to_portable(&json)
+            } else {
+                json
+            };
             writeln!(file, "{json}")
                 .with_context(|| format!("Failed to write to file: {}", path.display()))?;
         }

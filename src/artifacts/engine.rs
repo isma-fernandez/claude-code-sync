@@ -180,6 +180,14 @@ fn collect(
                     let project = crate::sync::discovery::extract_project_name(encoded);
                     rel = Path::new(project).join(parts.as_path());
                 }
+                // Attachments under portable_home follow their sessions: the home prefix of
+                // the encoded project dir becomes a placeholder.
+                if desc.dest == DestRoot::SessionTree
+                    && !filter.use_project_name_only
+                    && filter.portable_home
+                {
+                    rel = crate::portable::encode_relative_path(&rel);
+                }
                 files.push(CollectedFile {
                     abs: abs.to_path_buf(),
                     rel,
@@ -208,6 +216,50 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
 /// Copy every enabled artifact category into `<repo_root>/artifacts/`,
 /// classifying each file Added/Modified/Unchanged by byte comparison.
 /// Prompt history is union-merged into the repo copy instead of overwritten.
+/// Expand the home placeholder in content coming out of the sync repository.
+///
+/// Always applied, regardless of configuration: a local artifact never contains the
+/// placeholder, so this is a no-op for repositories written without `portable_home`, and
+/// non-UTF-8 artifacts pass through untouched.
+fn expand_home(bytes: Vec<u8>) -> Vec<u8> {
+    match std::str::from_utf8(&bytes) {
+        Ok(text) if crate::portable::has_token(text) => {
+            crate::portable::from_portable(text).into_bytes()
+        }
+        _ => bytes,
+    }
+}
+
+fn read_repo_bytes(path: &Path) -> Result<Vec<u8>> {
+    Ok(expand_home(fs::read(path)?))
+}
+
+fn read_repo_text(path: &Path) -> String {
+    fs::read(path)
+        .map(expand_home)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// Replace the local home with a placeholder on the way into the sync repository.
+fn to_repo_bytes(bytes: Vec<u8>, filter: &FilterConfig) -> Vec<u8> {
+    if !filter.portable_home {
+        return bytes;
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => crate::portable::to_portable(&text).into_bytes(),
+        Err(err) => err.into_bytes(),
+    }
+}
+
+fn to_repo_text(text: &str, filter: &FilterConfig) -> String {
+    if filter.portable_home {
+        crate::portable::to_portable(text)
+    } else {
+        text.to_string()
+    }
+}
+
 pub fn push_artifacts(
     claude_dir: &Path,
     repo_root: &Path,
@@ -233,20 +285,23 @@ pub fn push_artifacts(
 
             match desc.merge {
                 MergeStrategy::UnionJsonl => {
+                    // Merge in local terms — the repo copy is expanded on read — then store
+                    // the result back in portable form.
                     let local_text = fs::read_to_string(&file.abs).unwrap_or_default();
                     let existed = dest.is_file();
                     let repo_text = if existed {
-                        fs::read_to_string(&dest).unwrap_or_default()
+                        read_repo_text(&dest)
                     } else {
                         String::new()
                     };
                     let (merged, new_lines) = merge_history_lines(&repo_text, &local_text);
                     counts.merged_entries += new_lines;
+                    let merged_for_repo = to_repo_text(&merged, filter);
                     if !existed {
-                        write_atomic(&dest, merged.as_bytes())?;
+                        write_atomic(&dest, merged_for_repo.as_bytes())?;
                         counts.added += 1;
                     } else if merged != repo_text {
-                        write_atomic(&dest, merged.as_bytes())?;
+                        write_atomic(&dest, merged_for_repo.as_bytes())?;
                         counts.modified += 1;
                     } else {
                         counts.unchanged += 1;
@@ -256,6 +311,7 @@ pub fn push_artifacts(
                     let src_bytes = fs::read(&file.abs).with_context(|| {
                         format!("Failed to read artifact {}", file.abs.display())
                     })?;
+                    let src_bytes = to_repo_bytes(src_bytes, filter);
                     if !dest.is_file() {
                         write_atomic(&dest, &src_bytes)?;
                         counts.added += 1;
@@ -399,6 +455,13 @@ fn local_destination(
                     crate::sync::discovery::find_local_project_by_name(&projects_dir, &name)?;
                 return Some(local_project.join(parts.as_path()));
             }
+            if desc.dest == DestRoot::SessionTree && filter.portable_home {
+                return Some(
+                    claude_dir
+                        .join(dir)
+                        .join(crate::portable::decode_relative_path(rel)),
+                );
+            }
             Some(claude_dir.join(dir).join(rel))
         }
     }
@@ -432,7 +495,7 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
                         continue;
                     }
                     let local_text = fs::read_to_string(&local_path).unwrap_or_default();
-                    let repo_text = fs::read_to_string(&repo_path).unwrap_or_default();
+                    let repo_text = read_repo_text(&repo_path);
                     let (merged, _) = merge_history_lines(&local_text, &repo_text);
                     if merged != local_text {
                         plan.unions.push(write);
@@ -443,7 +506,7 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
                 MergeStrategy::RawOverwrite => {
                     if !local_path.is_file() {
                         plan.creates.push(write);
-                    } else if fs::read(&local_path)? != fs::read(&repo_path)? {
+                    } else if fs::read(&local_path)? != read_repo_bytes(&repo_path)? {
                         plan.overwrites.push(write);
                     } else {
                         plan.unchanged += 1;
@@ -481,7 +544,7 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
     let prompt_overwrites = interactive && crate::interactive_conflict::is_interactive();
 
     for write in &plan.creates {
-        let bytes = fs::read(&write.repo_path)?;
+        let bytes = read_repo_bytes(&write.repo_path)?;
         write_atomic(&write.local_path, &bytes)?;
         counts_for(&mut by_category, write.category).added += 1;
     }
@@ -505,14 +568,14 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
                 continue;
             }
         }
-        let bytes = fs::read(&write.repo_path)?;
+        let bytes = read_repo_bytes(&write.repo_path)?;
         write_atomic(&write.local_path, &bytes)?;
         counts_for(&mut by_category, write.category).modified += 1;
     }
 
     for write in &plan.unions {
         let local_text = fs::read_to_string(&write.local_path).unwrap_or_default();
-        let repo_text = fs::read_to_string(&write.repo_path).unwrap_or_default();
+        let repo_text = read_repo_text(&write.repo_path);
         let (merged, new_lines) = merge_history_lines(&local_text, &repo_text);
         write_atomic(&write.local_path, merged.as_bytes())?;
         let counts = counts_for(&mut by_category, write.category);

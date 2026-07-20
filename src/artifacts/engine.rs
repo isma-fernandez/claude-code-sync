@@ -213,9 +213,6 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Copy every enabled artifact category into `<repo_root>/artifacts/`,
-/// classifying each file Added/Modified/Unchanged by byte comparison.
-/// Prompt history is union-merged into the repo copy instead of overwritten.
 /// Expand the home placeholder in content coming out of the sync repository.
 ///
 /// Always applied, regardless of configuration: a local artifact never contains the
@@ -260,6 +257,9 @@ fn to_repo_text(text: &str, filter: &FilterConfig) -> String {
     }
 }
 
+/// Copy every enabled artifact category into `<repo_root>/artifacts/`,
+/// classifying each file Added/Modified/Unchanged by byte comparison.
+/// Prompt history is union-merged into the repo copy instead of overwritten.
 pub fn push_artifacts(
     claude_dir: &Path,
     repo_root: &Path,
@@ -297,10 +297,20 @@ pub fn push_artifacts(
                     let (merged, new_lines) = merge_history_lines(&repo_text, &local_text);
                     counts.merged_entries += new_lines;
                     let merged_for_repo = to_repo_text(&merged, filter);
+                    // Compare against the RAW repo copy, not the expanded one. Comparing
+                    // expanded text would report "unchanged" for a repo file that still holds
+                    // absolute paths, so turning portable_home on would never migrate an
+                    // existing history file — and the other machine would then union-merge a
+                    // duplicate of every line under its own home.
+                    let repo_raw = if existed {
+                        fs::read_to_string(&dest).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     if !existed {
                         write_atomic(&dest, merged_for_repo.as_bytes())?;
                         counts.added += 1;
-                    } else if merged != repo_text {
+                    } else if merged_for_repo != repo_raw {
                         write_atomic(&dest, merged_for_repo.as_bytes())?;
                         counts.modified += 1;
                     } else {

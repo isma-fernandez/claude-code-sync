@@ -37,7 +37,14 @@ pub fn pull_history(
 
     let state = SyncState::load()?;
     let repo = scm::open(&state.sync_repo_path)?;
-    let filter = FilterConfig::load()?;
+    let mut filter = FilterConfig::load()?;
+
+    // The repository decides the layout, not this machine's config: a machine that has not
+    // enabled portable_home must still read a portable repository correctly, or the two
+    // would rewrite each other's copies on every sync.
+    if crate::portable::repo_is_portable(&state.sync_repo_path) {
+        filter.portable_home = true;
+    }
     let claude_dir = claude_projects_dir()?;
 
     // Get the current branch name for operation record

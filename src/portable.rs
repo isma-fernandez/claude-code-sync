@@ -27,7 +27,14 @@ pub const HOME_TOKEN: &str = "{{CLAUDE_SYNC_HOME}}";
 /// starting with `HOME` cannot collide with a real encoded path.
 pub const HOME_DIR_TOKEN: &str = "HOME";
 
-/// Local home directory, honoring the same test override as the rest of the crate.
+/// Local home directory.
+///
+/// `CLAUDE_CODE_SYNC_HOME` overrides it for tests, mirroring `CLAUDE_CODE_SYNC_CLAUDE_DIR`:
+/// faking `HOME` cannot redirect `dirs::home_dir()` on Windows.
+///
+/// Note that this feature assumes POSIX-style absolute paths. On Windows a home like
+/// `C:\\Users\\alice` neither matches the backslash-escaped form serde writes into the
+/// JSONL nor encodes to Claude's directory name, so `portable_home` should stay off there.
 pub fn local_home() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CLAUDE_CODE_SYNC_HOME") {
         if !dir.is_empty() {
@@ -52,12 +59,39 @@ fn encoded_local_home() -> Option<String> {
     Some(local_home_str()?.replace(['/', '\\'], "-"))
 }
 
+/// True when `next` cannot continue a path segment, so an occurrence of the home ends here.
+///
+/// Without this, a home of `/Users/alice` would also match `/Users/alice-backup/notes.md`
+/// and turn it into `<home>-backup/notes.md`, which expands to a different directory on the
+/// receiving machine — silent path corruption that round-trips cleanly on the origin.
+fn ends_segment(next: Option<char>) -> bool {
+    match next {
+        None => true,
+        Some(c) => !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'),
+    }
+}
+
 /// Replace the local home prefix with [`HOME_TOKEN`]. No-op when the home is unknown.
 pub fn to_portable(content: &str) -> String {
-    match local_home_str() {
-        Some(home) => content.replace(&home, HOME_TOKEN),
-        None => content.to_string(),
+    let Some(home) = local_home_str() else {
+        return content.to_string();
+    };
+
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(idx) = rest.find(&home) {
+        let after = &rest[idx + home.len()..];
+        out.push_str(&rest[..idx]);
+        if ends_segment(after.chars().next()) {
+            out.push_str(HOME_TOKEN);
+            rest = after;
+        } else {
+            out.push_str(&home);
+            rest = after;
+        }
     }
+    out.push_str(rest);
+    out
 }
 
 /// Expand [`HOME_TOKEN`] back to the local home. No-op when the home is unknown.
@@ -71,6 +105,42 @@ pub fn from_portable(content: &str) -> String {
 /// True when the content carries a placeholder that needs expanding.
 pub fn has_token(content: &str) -> bool {
     content.contains(HOME_TOKEN)
+}
+
+/// Marker at the root of a sync repository whose contents are stored in portable form.
+///
+/// The mode has to be a property of the repository, not of each machine's config: a machine
+/// that has not enabled `portable_home` would otherwise push absolute paths into a portable
+/// repository and pull placeholder-named directories out of it, and the two machines would
+/// rewrite each other's copies on every sync. With the marker, whoever finds it follows it.
+pub const MARKER_FILE: &str = ".portable-home";
+
+/// True when this repository stores paths in portable form.
+pub fn repo_is_portable(repo_root: &std::path::Path) -> bool {
+    repo_root.join(MARKER_FILE).is_file()
+}
+
+/// Record that this repository stores paths in portable form. Idempotent.
+pub fn mark_repo_portable(repo_root: &std::path::Path) -> std::io::Result<()> {
+    let marker = repo_root.join(MARKER_FILE);
+    if marker.is_file() {
+        return Ok(());
+    }
+    std::fs::write(
+        marker,
+        format!(
+            "Home directories in this repository are stored as {HOME_TOKEN}.\n\
+             Managed by claude-code-sync; do not delete while any machine still syncs here.\n"
+        ),
+    )
+}
+
+/// Walk up from `path` looking for a repository marker.
+///
+/// Lets any writer that lands inside a portable repository canonicalize automatically,
+/// instead of relying on every call site remembering to pick the portable variant.
+pub fn is_inside_portable_repo(path: &std::path::Path) -> bool {
+    path.ancestors().skip(1).any(repo_is_portable)
 }
 
 fn replace_prefix(name: &str, prefix: &str, replacement: &str) -> Option<String> {
@@ -127,6 +197,7 @@ fn map_first_component(relative: &std::path::Path, f: fn(&str) -> String) -> Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::path::Path;
 
     struct HomeGuard;
@@ -143,6 +214,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn encodes_and_decodes_project_dir_round_trip() {
         let _g = with_home("/Users/alice");
         assert_eq!(encode_project_dir("-Users-alice-work"), "HOME-work");
@@ -150,6 +222,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn round_trip_is_stable_across_different_homes() {
         let encoded = {
             let _g = with_home("/Users/alice");
@@ -162,6 +235,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn leaves_paths_outside_home_untouched() {
         let _g = with_home("/Users/alice");
         assert_eq!(encode_project_dir("-srv-shared-proj"), "-srv-shared-proj");
@@ -169,6 +243,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn does_not_split_a_longer_sibling_name() {
         // /Users/alice-backup must not be mistaken for a path under /Users/alice.
         let _g = with_home("/Users/alice");
@@ -183,6 +258,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn encodes_the_home_root_itself() {
         let _g = with_home("/Users/alice");
         assert_eq!(encode_project_dir("-Users-alice"), "HOME");
@@ -190,6 +266,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn content_round_trips_between_machines() {
         let portable = {
             let _g = with_home("/Users/alice");
@@ -206,6 +283,48 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn does_not_tokenize_a_sibling_home_in_content() {
+        let _g = with_home("/Users/alice");
+        // /Users/alice-backup is a different directory, not a path under /Users/alice.
+        let text = r#"{"a":"/Users/alice/work","b":"/Users/alice-backup/notes.md"}"#;
+        let portable = to_portable(text);
+        assert!(portable.contains("/Users/alice-backup/notes.md"));
+        assert_eq!(
+            portable,
+            format!(r#"{{"a":"{HOME_TOKEN}/work","b":"/Users/alice-backup/notes.md"}}"#)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn tokenizes_the_home_at_the_end_of_a_value() {
+        let _g = with_home("/Users/alice");
+        assert_eq!(
+            to_portable(r#"{"cwd":"/Users/alice"}"#),
+            format!(r#"{{"cwd":"{HOME_TOKEN}"}}"#)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn marker_makes_the_repository_authoritative() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(!repo_is_portable(repo.path()));
+        mark_repo_portable(repo.path()).unwrap();
+        assert!(repo_is_portable(repo.path()));
+        mark_repo_portable(repo.path()).unwrap();
+
+        let nested = repo.path().join("projects").join("HOME-work");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(is_inside_portable_repo(&nested.join("s.jsonl")));
+
+        let outside = tempfile::tempdir().unwrap();
+        assert!(!is_inside_portable_repo(&outside.path().join("s.jsonl")));
+    }
+
+    #[test]
+    #[serial]
     fn expanding_content_without_a_token_is_a_no_op() {
         let _g = with_home("/Users/alice");
         let plain = r#"{"cwd":"/Users/alice/work"}"#;
@@ -213,6 +332,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn maps_only_the_first_path_component() {
         let _g = with_home("/Users/alice");
         let encoded = encode_relative_path(Path::new("-Users-alice-work/session.jsonl"));

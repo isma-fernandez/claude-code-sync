@@ -185,9 +185,16 @@ impl ConversationSession {
         })
     }
 
-    /// Write the conversation session to a JSONL file
+    /// Write the conversation session to a JSONL file.
+    ///
+    /// Writing anywhere inside a repository marked portable canonicalizes the home
+    /// automatically, so a writer that lands in the sync repo — conflict "keep both",
+    /// interactive resolution — cannot leave absolute paths behind by forgetting to pick
+    /// [`Self::write_to_file_portable`].
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        self.write_inner(path.as_ref(), false)
+        let path = path.as_ref();
+        let portable = crate::portable::is_inside_portable_repo(path);
+        self.write_inner(path, portable)
     }
 
     /// Write the session with the local home replaced by a placeholder, for storage in the

@@ -135,6 +135,20 @@ pub fn plan_push(
     Ok(plan)
 }
 
+/// Project directories in the sync repository that still carry this machine's absolute home,
+/// left over from pushes made before `portable_home` was enabled.
+fn legacy_project_dirs(projects_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(projects_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| crate::portable::encode_project_dir(name) != *name)
+        .collect()
+}
+
 /// Push local Claude Code history to sync repository
 pub fn push_history(
     commit_message: Option<&str>,
@@ -168,6 +182,16 @@ pub fn push_history(
             .context("Failed to set up Git LFS")?;
     }
 
+    // The repository decides the layout, not this machine's config, so a machine that has
+    // not enabled portable_home cannot push absolute paths into a portable repository.
+    if crate::portable::repo_is_portable(&state.sync_repo_path) {
+        filter.portable_home = true;
+    }
+    if filter.portable_home {
+        crate::portable::mark_repo_portable(&state.sync_repo_path)
+            .context("Failed to mark the sync repository as portable")?;
+    }
+
     let claude_dir = claude_projects_dir()?;
 
     // Get the current branch name for operation record
@@ -175,6 +199,37 @@ pub fn push_history(
         .map(|s| s.to_string())
         .or_else(|| repo.current_branch().ok())
         .unwrap_or_else(|| "main".to_string());
+
+    // A repository that was pushed before portable_home was enabled still holds the old
+    // absolute-path directories. Leaving them there means every other machine materializes
+    // this machine's layout on pull, which is exactly what the feature exists to prevent.
+    if filter.portable_home {
+        let stale = legacy_project_dirs(&state.sync_repo_path.join(&filter.sync_subdirectory));
+        if !stale.is_empty() {
+            println!();
+            println!(
+                "{}",
+                format!(
+                    "Warning: {} project director{} in the sync repository still use absolute \
+                     home paths and will be duplicated:",
+                    stale.len(),
+                    if stale.len() == 1 { "y" } else { "ies" }
+                )
+                .yellow()
+                .bold()
+            );
+            for name in stale.iter().take(5) {
+                println!("    - {name}");
+            }
+            println!(
+                "{}",
+                "  Rename them to the placeholder form or delete them once every machine has \
+                 pulled."
+                    .dimmed()
+            );
+            println!();
+        }
+    }
 
     // Discover all sessions
     println!("  {} conversation sessions...", "Discovering".cyan());
